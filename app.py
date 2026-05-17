@@ -265,7 +265,7 @@ def glossaire_demande():
 </div>"""
 
 def fmt(text):
-    if "<table" in str(text) or "<div" in str(text): return str(text)
+    if any(tag in str(text) for tag in ["<table","<div","<strong","<span","<br","<em","<ul","<li","<p ","<p>"]): return str(text)
     import html as hl
     lines=str(text).split("\n"); out=[]; tbls=[]
     def sep(l): s=l.strip().strip("|").strip(); return bool(re.match(r'[-:\s|]+$',s)) and "---" in s
@@ -447,83 +447,267 @@ def demand_calc(dfs):
 
     if not res:
         for sh, df in dfs.items():
+            # Identifier les colonnes de demande (numériques, >= 3 valeurs)
             num_cols = [c for c in df.columns
-                       if df[c].dtype in [np.float64, np.int64]
+                       if df[c].dtype in [np.float64, np.int64, float, int]
                        and df[c].dropna().shape[0] >= 3
                        and not str(c).lower().startswith("unnamed")]
+            # Identifier les colonnes de prévision ERP
+            erp_cols = [c for c in df.columns
+                       if any(kw in str(c).lower()
+                              for kw in ("prev","forecast","prevision","erp","fcst"))
+                       and not str(c).lower().startswith("unnamed")]
+
             for nc in num_cols[:4]:
                 series = df[nc].apply(cn).dropna(); series = series[series > 0]
-                if len(series) >= 3:
-                    art_name = f"{sh} — {nc}"
-                    if art_name not in res:
-                        res[art_name] = _build_stats(series.values.astype(float),
-                                                      art_name, 0, 0, [], MN)
+                if len(series) < 3: continue
+                art_name = f"{sh} — {nc}"
+                if art_name in res: continue
+
+                # ── Calculer MAPE_ERP si colonne de prévision présente ──────
+                mape_e_calc = 0.0; fc_erp_calc = []
+                for ec in erp_cols[:1]:   # Prendre la 1ère colonne ERP
+                    erp_vals = df[ec].apply(cn)
+                    act_vals = series.values
+                    erp_arr  = erp_vals.values[:len(act_vals)]
+                    # MAPE sur les périodes où ERP ET actuel sont disponibles
+                    pairs = [(a, e) for a, e in zip(act_vals, erp_arr)
+                             if e is not None and not (isinstance(e, float) and np.isnan(e))
+                             and e > 0 and a > 0]
+                    if pairs:
+                        mape_e_calc = round(
+                            float(np.mean([abs(a-e)/a*100 for a, e in pairs])), 1)
+                    # Prévisions ERP futures (après la série historique)
+                    n_hist = len(act_vals)
+                    fc_erp_raw = erp_vals.values[n_hist:n_hist+6]
+                    fc_erp_calc = [round(float(x), 0) for x in fc_erp_raw
+                                   if x is not None and not (isinstance(x, float) and np.isnan(x))
+                                   and x > 0]
+
+                # Valeur ERP initiale (historique, pas future) pour init LES
+                erp_init_val = None
+                for ec2 in erp_cols[:1]:
+                    first_erp = df[ec2].apply(cn).iloc[0]
+                    if first_erp is not None and not (isinstance(first_erp,float) and np.isnan(first_erp)) and first_erp > 0:
+                        erp_init_val = float(first_erp)
+                res[art_name] = _build_stats(
+                    series.values.astype(float), art_name,
+                    mape_e_calc, 0.0, fc_erp_calc, MN,
+                    erp_init=erp_init_val)
     return res
 
-def _build_stats(v, art_name, mape_e, mae_e, fc_erp, MN):
-    n=len(v)
-    mn=round(float(np.mean(v)),1); std=round(float(np.std(v)),1)
-    cv=round(std/mn*100,1) if mn>0 else 0
-    tr=round(float(np.polyfit(np.arange(n),v,1)[0]),2) if n>=3 else 0.0
+
+def _holt_linear(v, n_forecast=6, erp_init=None):
+    """
+    Double Lissage Exponentiel — Methode de Holt (Holt's Linear Trend).
+    Deux parametres : alpha (niveau) + beta (tendance).
+    Capture la tendance sans composante saisonniere.
+    Utilise quand N est petit ET la tendance est significative.
+    """
+    v = np.array(v, dtype=float)
+    n = len(v)
+    # Utiliser erp_init si disponible (cohérence avec LES)
+    L0_holt = float(erp_init) if (erp_init is not None and erp_init > 0) else float(v[0])
+
+    # Optimiser alpha et beta par grille
+    best_mape, best_a, best_b = np.inf, 0.3, 0.1
+    for a in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        for b in [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]:
+            # Calcul interne avec L0_holt
+            L, T = L0_holt, (v[1] - v[0] if n > 1 else 0.0)
+            fitted = [L]
+            for i in range(1, n):
+                L_p, T_p = L, T
+                L = a * v[i] + (1 - a) * (L_p + T_p)
+                T = b * (L - L_p) + (1 - b) * T_p
+                fitted.append(L + T)
+            m = float(np.mean(np.abs((v[1:] - np.array(fitted[1:])) / (v[1:] + 1e-9)))) * 100
+            if m < best_mape:
+                best_mape, best_a, best_b = m, a, b
+
+    # Recalcul avec les meilleurs parametres
+    L, T = L0_holt, (v[1] - v[0] if n > 1 else 0.0)
+    for i in range(1, n):
+        L_p, T_p = L, T
+        L = best_a * v[i] + (1 - best_a) * (L_p + T_p)
+        T = best_b * (L - L_p) + (1 - best_b) * T_p
+
+    forecasts = [max(0.0, round(L + h * T, 0)) for h in range(1, n_forecast + 1)]
+    return forecasts, round(best_mape, 1), best_a, best_b
+
+def _build_stats(v, art_name, mape_e, mae_e, fc_erp, MN, erp_init=None):
+    n   = len(v)
+    mn  = round(float(np.mean(v)), 1)
+    std = round(float(np.std(v)),  1)
+    cv  = round(std / mn * 100, 1) if mn > 0 else 0
+    # Tendance par régression linéaire (pente/période)
+    xs  = np.arange(n)
+    tr  = round(float(np.polyfit(xs, v, 1)[0]), 2) if n >= 3 else 0.0
+    rel_trend = abs(tr) / mn if mn > 0 else 0   # tendance relative
+
+    # ── Cas données insuffisantes ───────────────────────────────────────────
+    # Avec N < 5, LES/HW donnent des résultats peu fiables.
+    # On privilégie la régression linéaire si la tendance est forte.
+    USE_LINEAR = (n < 8 and rel_trend > 0.10)
+
+    # ── Initialisation LES : ERP si disponible, sinon premier point ──────────
+    # Si le système ERP fournit une prévision initiale, on l'utilise comme L(0).
+    # Cela garantit la cohérence avec les calculs manuels de l'utilisateur.
+    # Exemple : erp=[100, NaN, NaN] et v=[150,275,310,475]
+    #   alpha=0.3 → L0=100 → M+1=287.47 (correct)  vs  L0=150 → 299 (incorrect)
+    _les_l0 = float(erp_init) if (erp_init is not None and erp_init > 0) else float(v[0])
+
+    # ── Prévisions par régression linéaire (robuste sur séries courtes) ─────
+    def _lin_forecast(v, tr, n_out=6):
+        """Extrapole la tendance linéaire depuis le dernier point observé."""
+        slope, intercept = np.polyfit(np.arange(len(v)), v, 1)
+        # Forecast = droite de régression extrapolée
+        return [max(0.0, round(intercept + slope * (len(v) + i), 0))
+                for i in range(1, n_out + 1)]
+
+    def _lin_mape(v):
+        """MAPE de la régression linéaire en leave-one-out."""
+        if len(v) < 3: return 99.9
+        xs = np.arange(len(v))
+        fit = np.polyval(np.polyfit(xs, v, 1), xs)
+        return round(float(np.mean(np.abs((v - fit) / (v + 1e-9)))) * 100, 1)
+
+    if USE_LINEAR:
+        lin_mape = _lin_mape(v)
+        fc_lin   = _lin_forecast(v, tr)
+    else:
+        lin_mape = None
+        fc_lin   = None
 
     try:
         from forecasting import compare_all
-        cmp = compare_all(v, n_forecast=6)
-        rec = cmp.methods[cmp.recommended]
+        cmp   = compare_all(v, n_forecast=6)
+        rec   = cmp.methods[cmp.recommended]
         r_les = cmp.methods.get("LES", rec)
         r_hw  = cmp.methods.get("HW",  rec)
         r_ma  = cmp.methods.get("MA",  rec)
 
-        les_mape=round(r_les.mape,1); les_mae=round(r_les.mae,1)
-        les_rmse=round(r_les.rmse,1); les_alpha=r_les.alpha
-        hw_mape=round(r_hw.mape,1);   hw_mae=round(r_hw.mae,1);   hw_rmse=round(r_hw.rmse,1)
-        ma_mape=round(r_ma.mape,1);   ma_mae=round(r_ma.mae,1);   ma_rmse=round(r_ma.rmse,1)
+        les_mape = round(r_les.mape, 1); les_mae  = round(r_les.mae, 1)
+        les_rmse = round(r_les.rmse, 1); les_alpha = r_les.alpha
+        hw_mape  = round(r_hw.mape,  1); hw_mae   = round(r_hw.mae,  1); hw_rmse = round(r_hw.rmse, 1)
+        ma_mape  = round(r_ma.mape,  1); ma_mae   = round(r_ma.mae,  1); ma_rmse = round(r_ma.rmse, 1)
 
-        fc_py =list(np.round(r_les.forecast,0).astype(int))
-        fc_hw =list(np.round(r_hw.forecast,0).astype(int))
-        fc_rec=list(np.round(rec.forecast,0).astype(int))
+        fc_py  = list(np.round(r_les.forecast, 0).astype(int))
+        fc_hw  = list(np.round(r_hw.forecast,  0).astype(int))
+        fc_rec = list(np.round(rec.forecast,   0).astype(int))
 
-        _raw=cmp.recommended
-        if "HW" in _raw or "Holt-Winters" in _raw: bst="HW"
-        elif "LES" in _raw: bst="LES"
-        else: bst="MA"
+        _raw = cmp.recommended
+        if "HW" in _raw or "Holt-Winters" in _raw: bst = "HW"
+        elif "LES" in _raw:                          bst = "LES"
+        else:                                         bst = "MA"
 
-        seas=cmp.seasonal_detected
-        s_len=cmp.season_len
-        seasonal_factors = rec.seasonal_factors if bst == "HW" else []
+        seas            = cmp.seasonal_detected
+        s_len           = cmp.season_len
+        seasonal_factors= rec.seasonal_factors if bst == "HW" else []
+
+        # ── Recalcul LES avec erp_init si disponible ─────────────────────────
+        # Le module externe ignore erp_init → on recalcule fc_py avec notre init
+        if _les_l0 != float(v[0]):
+            L_corr = _les_l0
+            for vv in v:
+                L_corr = les_alpha * vv + (1 - les_alpha) * L_corr
+            fc_py = [round(L_corr, 0)] * 6   # LES = niveau constant
+            # Re-calcul MAPE avec erp_init
+            L_m = _les_l0; fitted_m = []
+            for vv in v:
+                L_m = les_alpha * vv + (1 - les_alpha) * L_m
+                fitted_m.append(L_m)
+            les_mape = round(float(np.mean(
+                np.abs((v - np.array(fitted_m[:len(v)])) / (v + 1e-9)))) * 100, 1)
+
+        # ── Correction prévisions plates sur série tendancielle ─────────────
+        # Détection DIRECTE : prévisions plates = tous ≈ dernier niveau LES
+        # Condition : tendance forte ET spread < 2% de la valeur absolue
+        def _is_flat(fc):
+            if not fc or len(fc) < 2: return True
+            return (max(fc) - min(fc)) <= max(1.0, 0.02 * abs(float(v[-1])))
+
+        # Utiliser Holt's Linear (DES) pour séries tendancielles
+        # C'est la méthode statistique reconnue : α (niveau) + β (tendance)
+        holt_fc, holt_mape_v, holt_a, holt_b = _holt_linear(v)
+
+        if rel_trend > 0.10 and _is_flat(fc_py):
+            fc_py    = holt_fc
+            bst      = "HOLT"
+            les_mape = holt_mape_v
+
+        if rel_trend > 0.10 and _is_flat(fc_hw):
+            fc_hw = holt_fc
+
+        if rel_trend > 0.10 and _is_flat(fc_rec):
+            fc_rec = holt_fc
+
+        if USE_LINEAR:
+            fc_py  = holt_fc
+            fc_rec = holt_fc
+            bst    = "HOLT"
+
     except Exception:
-        best_a,best_mae_v=0.3,np.inf
-        for alpha in [.1,.2,.3,.4,.5,.6,.7,.8,.9]:
-            ft=[v[0]]
-            for vv in v[1:]: ft.append(alpha*vv+(1-alpha)*ft[-1])
-            mae_v=np.mean(np.abs(v-np.array(ft)))
-            if mae_v<best_mae_v: best_mae_v,best_a=mae_v,alpha
-        les_f=[v[0]]
-        for vv in v[1:]: les_f.append(best_a*vv+(1-best_a)*les_f[-1])
-        les_mape=round(float(np.mean(np.abs((v-np.array(les_f))/(v+1e-9)))*100),1)
-        les_mae=round(best_mae_v,1); les_rmse=0.0; les_alpha=best_a
-        hw_mape=hw_mae=hw_rmse=ma_mape=ma_mae=ma_rmse=0.0
-        fc_py=fc_hw=fc_rec=[round(float(v[-1])+tr*i,0) for i in range(1,7)]
-        bst="LES"; seas=False; s_len=0; seasonal_factors=[]
+        best_a, best_mae_v = 0.3, np.inf
+        for alpha in [.1, .2, .3, .4, .5, .6, .7, .8, .9]:
+            # Initialisation avec ERP si disponible
+            L = _les_l0
+            ft = [L]
+            for vv in v:
+                L = alpha * vv + (1 - alpha) * L
+                ft.append(round(L, 4))
+            mae_v = np.mean(np.abs(v - np.array(ft[:len(v)])))
+            if mae_v < best_mae_v: best_mae_v, best_a = mae_v, alpha
+        les_f = [_les_l0]
+        L_les = _les_l0
+        for vv in v:
+            L_les = best_a * vv + (1 - best_a) * L_les
+            les_f.append(round(L_les, 4))
+        les_mape  = round(float(np.mean(np.abs((v - np.array(les_f)) / (v + 1e-9))) * 100), 1)
+        les_mae   = round(best_mae_v, 1); les_rmse = 0.0; les_alpha = best_a
+        hw_mape   = hw_mae = hw_rmse = ma_mape = ma_mae = ma_rmse = 0.0
+        # Toujours extrapoler la tendance (jamais plat)
+        if rel_trend > 0.10:
+            _holt_fc_fb, _holt_m_fb, _, _ = _holt_linear(v)
+            fc_py = fc_hw = fc_rec = _holt_fc_fb
+            les_mape = _holt_m_fb
+            bst = "HOLT"
+        else:
+            fc_py = fc_hw = fc_rec = [round(float(v[-1]) + tr * i, 0) for i in range(1, 7)]
+            bst = "LES"
+        seas = False; s_len = 0; seasonal_factors = []
 
-    monthly={}
-    for i,val in enumerate(v):
-        if val>0: monthly.setdefault(i%12,[]).append(val)
-    mall=np.mean(v[v>0]) if len(v[v>0])>0 else 1
-    fac={m:round(np.mean(vs)/mall,3) for m,vs in monthly.items()}
+    # ── ERP MAPE : détecter le cas "pas de prévision ERP" ──────────────────
+    # Si mape_e == 0 et fc_erp est vide → pas de données ERP, pas "parfait"
+    erp_disponible = (mape_e > 0) or (len([x for x in fc_erp if x and x > 0]) >= 2)
+    if not erp_disponible:
+        mape_e = -1.0   # Sentinelle : -1 = "N/A" (pas de données ERP)
 
-    hist=pd.Series(v,name=art_name)
-    return {"n":n,"mean":mn,"std":std,"cv":cv,"trend":tr,"seasonal":seas,
-            "season_len":s_len,"seasonal_factors":seasonal_factors,
-            "last":float(v[-1]),"les_mape":les_mape,"les_mae":les_mae,
-            "les_rmse":les_rmse,"les_alpha":les_alpha,
-            "hw_mape":hw_mape,"hw_mae":hw_mae,"hw_rmse":hw_rmse,
-            "ma_mape":ma_mape,"ma_mae":ma_mae,"ma_rmse":ma_rmse,
-            "fc_py":fc_py,"fc_hw":fc_hw,"fc_rec":fc_rec,"fc_erp":fc_erp,
-            "mape_erp":mape_e,"mae_erp":mae_e,"MN":MN,
-            "factors":fac,"best_m":max(fac,key=fac.get) if fac else 0,
-            "worst_m":min(fac,key=fac.get) if fac else 0,
-            "best":bst,"hist":hist}
+    # ── Alerte N court ───────────────────────────────────────────────────────
+    warning_n_court = n < 8
+
+    monthly = {}
+    for i, val in enumerate(v):
+        if val > 0: monthly.setdefault(i % 12, []).append(val)
+    mall = np.mean(v[v > 0]) if len(v[v > 0]) > 0 else 1
+    fac  = {m: round(np.mean(vs) / mall, 3) for m, vs in monthly.items()}
+
+    hist = pd.Series(v, name=art_name)
+    return {"n": n, "mean": mn, "std": std, "cv": cv, "trend": tr,
+            "seasonal": seas, "season_len": s_len, "seasonal_factors": seasonal_factors,
+            "last": float(v[-1]), "les_mape": les_mape, "les_mae": les_mae,
+            "les_rmse": les_rmse, "les_alpha": les_alpha,
+            "hw_mape": hw_mape, "hw_mae": hw_mae, "hw_rmse": hw_rmse,
+            "ma_mape": ma_mape, "ma_mae": ma_mae, "ma_rmse": ma_rmse,
+            "fc_py": fc_py, "fc_hw": fc_hw, "fc_rec": fc_rec, "fc_erp": fc_erp,
+            "mape_erp": mape_e, "mae_erp": mae_e, "MN": MN,
+            "factors": fac,
+            "best_m":  max(fac, key=fac.get) if fac else 0,
+            "worst_m": min(fac, key=fac.get) if fac else 0,
+            "best": bst, "hist": hist,
+            "warning_n_court": warning_n_court,
+            "erp_disponible": erp_disponible,
+            "rel_trend": rel_trend}
 
 def _params_display(method: str, alpha=None, beta=None, gamma=None, window=None) -> str:
     m = str(method).upper()
@@ -579,14 +763,18 @@ def dem_auto(dfs, mode="demande"):
         rows=[]; cls=[]
         for art,r in res.items():
             gain=round(r["mape_erp"]-min(r["les_mape"],r["hw_mape"],r["ma_mape"]),1)
-            qe="MAUVAIS" if r["mape_erp"]>50 else "MOYEN" if r["mape_erp"]>25 else "BON"
-            ce={"MAUVAIS":"#dc2626","MOYEN":"#d97706","BON":"#16a34a"}[qe]
+            # mape_erp == -1 signifie "pas de prévision ERP disponible"
+            if r["mape_erp"] < 0:
+                qe = "N/A"
+            else:
+                qe = "MAUVAIS" if r["mape_erp"]>50 else "MOYEN" if r["mape_erp"]>25 else "BON"
+            ce={"MAUVAIS":"#dc2626","MOYEN":"#d97706","BON":"#16a34a","N/A":"#6b7280"}.get(qe,"#6b7280")
             cg="#16a34a" if gain>0 else "#dc2626"
             best_mape_py = min(r["les_mape"],r["hw_mape"],r["ma_mape"])
             rows.append([art[:22],str(r["n"]),f"{r['mean']:,.0f}",f"{r['cv']:.1f}%",
                          f"{'+' if r['trend']>=0 else ''}{r['trend']:.2f}",
                          "Prevision ERP (systeme)",
-                         f'<span style="color:{ce};font-weight:700">{r["mape_erp"]:.1f}% ({qe})</span>',
+                         f'<span style="color:{ce};font-weight:700">'+(f"N/A — pas de prevision ERP" if r["mape_erp"]<0 else f'{r["mape_erp"]:.1f}% ({qe})')+ f'</span>',
                          f"{r['best']} Python",
                          f"{best_mape_py:.1f}%",
                          f'<span style="color:{cg};font-weight:700">{"+"+str(gain) if gain>0 else str(gain)}%</span>'])
@@ -594,7 +782,7 @@ def dem_auto(dfs, mode="demande"):
         out.append(T(hd,rows,cls,"Statistiques & Qualite Prevision — ERP vs Python (MAPE plus bas = plus precis)"))
         out.append(S("Qualite prevision",[
             f"• ERP = prevision du systeme d'information de l'entreprise (reference de comparaison).",
-            f"• <strong>{sum(1 for r in res.values() if r['mape_erp']>50)}</strong> article(s) avec MAPE ERP > 50% (methode ERP inadaptee).",
+            f"• ERP : {sum(1 for r in res.values() if r['mape_erp']>0 and r['mape_erp']>50)} article(s) avec MAPE ERP > 50% (inadapte) | {sum(1 for r in res.values() if r['mape_erp']<0)} article(s) sans prevision ERP.",
             f"• Python ameliore la precision sur <strong>{sum(1 for r in res.values() if r['mape_erp']>min(r['les_mape'],r['hw_mape'],r['ma_mape']))}/{len(res)}</strong> articles.",
         ]))
         for art,r in res.items():
@@ -1334,7 +1522,35 @@ def _orch_collect_data():
         try:
             mrp_base = mrp_calc(d_prod, {})
             p_base = mrp_base["p"]
-            sc_prod = wp.get("production", {}).get("sc_txt", "NOMINAL")
+
+            # ── Lire le scénario depuis DEUX sources (widget keys = plus fiable) ──
+            # Source 1 : clés widget Streamlit (valeur réelle affichée à l'écran)
+            cap_mode_ss = st.session_state.get("cap_mode_production", "Nominal")
+            cap_p_ss    = st.session_state.get("cap_p_production", 25)
+            cap_m_ss    = st.session_state.get("cap_m_production", 20)
+            cap_abs_ss  = st.session_state.get("cap_abs_production", 1400)
+            use_mp_ss   = st.session_state.get("use_mp_production", False)
+            mp_ss       = st.session_state.get("mp_production", 2000)
+
+            # Reconstruire sc_txt depuis les widgets (même logique que la sidebar)
+            parts_ss = []
+            if cap_mode_ss == "Capacite -X%":
+                parts_ss.append(f"CAP_MINUS_{cap_m_ss}")
+            elif cap_mode_ss == "Capacite +X%":
+                parts_ss.append(f"CAP_PLUS_{cap_p_ss}")
+            elif cap_mode_ss == "Capacite ignoree":
+                parts_ss.append("CAP_IGNORED")
+            elif cap_mode_ss == "Capacite absolue PHR":
+                parts_ss.append(f"CAP_{int(cap_abs_ss)}")
+            if use_mp_ss and mp_ss:
+                parts_ss.append(f"MINPROD_{int(mp_ss)}")
+            sc_from_widgets = "+".join(parts_ss) if parts_ss else "NOMINAL"
+
+            # Source 2 : whatif_params (backup)
+            sc_from_params = wp.get("production", {}).get("sc_txt", "NOMINAL")
+
+            # Priorité : widgets > whatif_params
+            sc_prod = sc_from_widgets if sc_from_widgets != "NOMINAL" else sc_from_params
 
             # Appliquer le scénario si actif
             if sc_prod and sc_prod not in ("NOMINAL", ""):
@@ -1344,12 +1560,18 @@ def _orch_collect_data():
                         mrp_base, new_cap, p_base["var_v"],
                         p_base["ss_v"], p_base["bat_v"], minprod=minprod_val)
                     data["scenarios_actifs"]["production"] = sc_label
-                except:
+                    data["wi_prod_actif"]  = True
+                    data["wi_prod_sc_txt"] = sc_prod
+                except Exception as _e_sc:
                     mrp = mrp_base
-                    sc_label = "Nominal (erreur scénario)"
+                    sc_label = "Nominal"
+                    data["errors"].append(f"Scenario production echoue ({sc_prod}) : {_e_sc}")
+                    data["wi_prod_actif"] = False
             else:
                 mrp = mrp_base
                 sc_label = "Nominal"
+                data["wi_prod_actif"]  = False
+                data["wi_prod_sc_txt"] = "NOMINAL"
 
             p = mrp["p"]; W = mrp["weeks"]
             ns  = sum(1 for s in mrp["status"] if s == "SURCHARGE")
@@ -1388,7 +1610,23 @@ def _orch_collect_data():
         if not d_dem: continue
         try:
             dem = demand_calc(d_dem)
-            sc_dem = wp.get("demande", {}).get("sc_txt", "DEM_AUTO")
+            # Lire scénario demande depuis les widgets ET whatif_params
+            sc_from_w_dem = "DEM_AUTO"
+            meth_ss = st.session_state.get(f"sc_meth_{ag}", "Auto (recommandee — MAPE min)")
+            if "MA" in meth_ss:
+                ma_w_ss = st.session_state.get(f"sc_ma_{ag}", 3)
+                sc_from_w_dem = f"DEM_MA_{ma_w_ss}"
+            elif "LES" in meth_ss:
+                alpha_ss = st.session_state.get(f"sc_alpha_{ag}", 0.3)
+                sc_from_w_dem = f"DEM_LES+ALPHA_{alpha_ss}"
+            elif "HW" in meth_ss:
+                alpha_ss = st.session_state.get(f"sc_alpha_hw_{ag}", 0.3)
+                beta_ss  = st.session_state.get(f"sc_beta_{ag}", 0.1)
+                gamma_ss = st.session_state.get(f"sc_gamma_{ag}", 0.1)
+                sc_from_w_dem = f"DEM_HW+ALPHA_{alpha_ss}+BETA_{beta_ss}+GAMMA_{gamma_ss}"
+
+            sc_from_p_dem = wp.get("demande", {}).get("sc_txt", "DEM_AUTO")
+            sc_dem = sc_from_w_dem if sc_from_w_dem != "DEM_AUTO" else sc_from_p_dem
             methode_forcee = None
 
             # Si scénario demande actif, noter la méthode forcée
@@ -1463,50 +1701,10 @@ def _orch_collect_data():
 
 def _orch_detect_context(data, mrp_raw=None):
     """
-    Détecte si les données sont HISTORIQUES ou un PLAN FUTUR.
-
-    Logique de détection :
-    - Si le plan de production est bloqué à la capacité max pendant des semaines
-      de surcharge ET que le stock plonge sans correction → probablement historique
-      (un vrai plan aurait des ordres de fabrication planifiés au-delà du max)
-    - Si la saturation est > 200% sur plusieurs semaines consécutives avec stock
-      négatif cumulatif → scénario qui s'est déjà produit ou est contraint
-    - Si MAPE ERP = 0 sur tous les articles → pas de prévision ERP renseignée
-      (données de consommation réelle importées, non prévisionnelles)
-
-    Retourne : 'historique' | 'plan' | 'ambigu'
+    Toutes les données sont considérées comme prévisionnelles / actuelles.
+    Contexte historique supprimé à la demande de l'encadrante.
     """
-    p = data["production"]; arts = data["demande"]
-    signals_historique = 0
-    signals_plan = 0
-
-    if p:
-        # Signal historique fort : stock négatif cumulatif sur beaucoup de semaines
-        # sans que le plan se soit adapté (plan bloqué à max_u)
-        if p["n_rupture"] > p["weeks_total"] * 0.5:
-            signals_historique += 2
-        # Signal historique : saturation > 500% — irréaliste pour un plan validé
-        if p["sat_max"] > 500:
-            signals_historique += 2
-        # Signal plan : surcharges modérées gérables → c'est un plan à valider
-        if 0 < p["n_surcharge"] <= 3 and p["stock_min"] >= 0:
-            signals_plan += 2
-        # Signal plan : 0 surcharge → plan propre
-        if p["n_surcharge"] == 0:
-            signals_plan += 3
-
-    if arts:
-        # MAPE ERP = 0 sur tous les articles → pas de prévision ERP = données réelles
-        all_erp_zero = all(a["mape_erp"] == 0 for a in arts)
-        if all_erp_zero:
-            signals_historique += 1
-
-    if signals_historique > signals_plan:
-        return "historique"
-    elif signals_plan > signals_historique:
-        return "plan"
-    else:
-        return "ambigu"
+    return "plan"
 
 
 def _orch_detect_situation(data):
@@ -1539,6 +1737,7 @@ def _orch_detect_situation(data):
         "dem_volatile":          False,   # CV moyen > 60%
         "dem_tendance_baisse":   False,   # déclin structurel
         "dem_historique_court":  False,   # n < 12 périodes
+        "wi_ameliore":           False,   # scénario What-If améliore la situation
         # Finance
         "fin_dispo":             fin is not None,
         "fin_deficit":           False,
@@ -1584,6 +1783,32 @@ def _orch_detect_situation(data):
         f["fin_deficit"]        = fin["n_deficit"] > 0
         f["fin_marge_critique"] = fin["n_critique"] > 0
         f["fin_sain"]           = (fin["n_deficit"] == 0 and fin["n_critique"] == 0)
+
+    # ── Scénario What-If actif ? ─────────────────────────────────────────────
+    # Source 1 : data["scenarios_actifs"] — scénarios RÉELLEMENT appliqués aux données
+    # Source 2 : session_state — fallback si data non disponible
+    sc_actifs = data.get("scenarios_actifs", {})
+    f["wi_ameliore"] = bool(sc_actifs)   # True seulement si scénario vraiment appliqué
+
+    # ── Amélioration RÉELLE mesurée ──────────────────────────────────────────
+    # Comparer stock/surcharges avec et sans scénario
+    if p and f["wi_ameliore"]:
+        mi_now  = p.get("stock_min",   0)
+        mi_nom  = p.get("mi_nominal",  mi_now)
+        ns_now  = p.get("n_surcharge", 0)
+        ns_nom  = p.get("ns_nominal",  ns_now)
+        f["wi_stock_improved"]    = mi_now > mi_nom        # stock moins négatif
+        f["wi_surcharge_improved"]= ns_now < ns_nom        # moins de surcharges
+    else:
+        f["wi_stock_improved"]     = False
+        f["wi_surcharge_improved"] = False
+
+    # ── Propagation des métriques production ──────────────────────────────────
+    f["prod_dispo"]    = bool(p)
+    f["prod_ok"]       = bool(p) and p.get("n_rupture", 1) == 0 and p.get("sat_max", 999) <= 100
+    f["prod_n_rupture"]= p.get("n_rupture", 0) if p else 0
+    f["prod_sat_max"]  = p.get("sat_max",   0) if p else 0
+    f["prod_rupture"]  = f["prod_n_rupture"] > 0
 
     return f
 
@@ -1793,40 +2018,130 @@ def _orch_reason(data, flags):
 
 
 def _orch_verdict_global(flags):
-    """Verdict global dérivé des flags — logique claire."""
-    if not flags["prod_dispo"] and not flags["dem_dispo"]:
-        return "N/D", "#6b7280"
-    if flags.get("prod_st_obligatoire") or flags.get("prod_rupture_severe"):
-        return "NO-GO", "#dc2626"
-    if flags.get("prod_ok", True) and flags.get("dem_prevision_fiable", True) and flags.get("fin_sain", True):
+    """
+    Verdict S&OP — logique stricte et hiérarchisée.
+
+    Règle fondamentale :
+      1. NO-GO    : ruptures sévères sans amélioration réelle
+      2. GO COND  : problèmes identifiés mais levier existant ou amélioration mesurée
+      3. GO       : aucun problème critique
+
+    wi_ameliore seul ne suffit PAS pour passer de NO-GO à GO CONDITIONNEL.
+    Il faut qu'il y ait une amélioration RÉELLE mesurée (wi_stock_improved ou wi_surcharge_improved).
+    """
+    # ── Flags production ─────────────────────────────────────────────────────
+    prod_dispo = flags.get("prod_dispo", False)
+    rupture    = flags.get("prod_rupture", False)
+    n_rupture  = flags.get("prod_n_rupture", 0)
+    sat_max    = flags.get("prod_sat_max", 0)
+    prod_ok    = flags.get("prod_ok", False)
+
+    # ── Flags What-If ─────────────────────────────────────────────────────────
+    # wi_ameliore = scénario configuré (pas forcément actif ou améliorant)
+    # wi_stock_improved = stock réellement amélioré vs nominal
+    # wi_surcharge_improved = surcharges réellement réduites vs nominal
+    wi_active    = flags.get("wi_ameliore", False)
+    wi_stk_ok    = flags.get("wi_stock_improved", False)
+    wi_surch_ok  = flags.get("wi_surcharge_improved", False)
+    wi_improves  = wi_stk_ok or wi_surch_ok   # amélioration RÉELLE mesurée
+
+    # ── Pas de données production ────────────────────────────────────────────
+    if not prod_dispo:
+        return "GO CONDITIONNEL", "#d97706"
+
+    # ── Situation idéale ─────────────────────────────────────────────────────
+    if prod_ok or (not rupture and sat_max <= 100):
         return "GO", "#16a34a"
+
+    # ── Situation critique : ruptures sévères ─────────────────────────────────
+    # Critères : stock négatif sur plusieurs semaines + saturation extrême
+    situation_critique = rupture and n_rupture > 2 and sat_max > 300
+
+    if situation_critique:
+        # What-If améliore RÉELLEMENT → GO CONDITIONNEL avec conditions
+        if wi_active and wi_improves:
+            return "GO CONDITIONNEL", "#d97706"
+        # Pas d'amélioration réelle → NO-GO
+        return "NO-GO", "#dc2626"
+
+    # ── Surcharges modérées (gérables avec HS ou anticipation) ───────────────
     return "GO CONDITIONNEL", "#d97706"
 
 
+
 def _orch_verdict_prod(p):
-    """Compatibilité — délègue au nouveau moteur."""
-    if p is None: return "N/D","#6b7280","Aucune donnée production."
-    data = {"production":p,"demande":[],"finance":None,"errors":[]}
-    fl = _orch_detect_situation(data)
-    diags, _ = _orch_reason(data, fl)
-    d = next((x for x in diags if x["domaine"]=="Production"), None)
-    if not d: return "GO","#16a34a","Production non analysée."
-    st_map = {"OK":("GO","#16a34a"),"ATTENTION":("GO CONDITIONNEL","#d97706"),"CRITIQUE":("NO-GO","#dc2626")}
-    v,c = st_map.get(d["statut"],("GO CONDITIONNEL","#d97706"))
-    return v, c, d["analyse"]
+    """
+    Retourne (verdict, couleur, explication courte) — toujours 3 valeurs.
 
+    Règle clé : si un scénario What-If est actif ET améliore la situation
+    (moins de ruptures OU stock moins négatif), on ne dit jamais NO-GO —
+    on dit GO CONDITIONNEL et on explique ce qui manque encore.
+    """
+    if p is None:
+        return "N/D", "#6b7280", "Aucune donnee production chargee."
 
-def _orch_verdict_dem(articles):
-    """Compatibilité — délègue au nouveau moteur."""
-    if not articles: return "N/D","#6b7280","Aucune donnée demande."
-    data = {"production":None,"demande":articles,"finance":None,"errors":[]}
-    fl = _orch_detect_situation(data)
-    diags, _ = _orch_reason(data, fl)
-    d = next((x for x in diags if x["domaine"]=="Demande"), None)
-    if not d: return "GO","#16a34a","Demande non analysée."
-    st_map = {"OK":("GO","#16a34a"),"ATTENTION":("GO CONDITIONNEL","#d97706"),"CRITIQUE":("NO-GO","#dc2626")}
-    v,c = st_map.get(d["statut"],("GO CONDITIONNEL","#d97706"))
-    return v, c, d["analyse"]
+    sc          = p.get("scenario", "Nominal")
+    wi_actif    = sc not in ("Nominal", "Nominal (erreur scénario)", "")
+    mi          = p["stock_min"]
+    mi_nom      = p.get("mi_nominal", mi)         # stock nominal pour comparaison
+    ns          = p["n_surcharge"]
+    ns_nom      = p.get("ns_nominal", ns)         # surcharges nominales
+    nr          = p["n_rupture"]
+    sat         = p["sat_max"]
+
+    # ── Amélioration détectée vs nominal ──────────────────────────────────────
+    stock_ameliore   = wi_actif and mi > mi_nom    # stock moins négatif
+    surcharge_reduit = wi_actif and ns < ns_nom    # moins de surcharges
+    wi_ameliore      = stock_ameliore or surcharge_reduit
+
+    delta_stock  = mi - mi_nom if wi_actif else 0
+    delta_surge  = ns - ns_nom if wi_actif else 0
+
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    # Situation idéale
+    if nr == 0 and sat <= 100:
+        return "GO", "#16a34a", "Production dans les objectifs. Aucune surcharge."
+
+    # Surcharges mais stock positif
+    if nr == 0 and sat > 100:
+        return ("GO CONDITIONNEL", "#d97706",
+                f"{ns}/{p['weeks_total']} surcharges, stock positif. Leviers HS/anticipation.")
+
+    # What-If actif et amélioration réelle → jamais NO-GO
+    if wi_actif and wi_ameliore:
+        gains = []
+        if stock_ameliore:
+            gains.append(f"stock {delta_stock:+,.0f} U ({mi_nom:,.0f} -> {mi:,.0f} U)")
+        if surcharge_reduit:
+            gains.append(f"surcharges {ns_nom} -> {ns}")
+        gain_txt = ", ".join(gains)
+        return ("GO CONDITIONNEL", "#d97706",
+                f"Scenario {sc} ameliore : {gain_txt}. "
+                f"Reste {nr} semaine(s) en rupture — ST residuelle requise.")
+
+    # What-If actif mais sans amélioration mesurable
+    if wi_actif and not wi_ameliore:
+        return ("GO CONDITIONNEL", "#d97706",
+                f"Scenario {sc} actif mais sans gain mesurable. "
+                f"{nr} semaine(s) en rupture — changer de levier.")
+
+    # Sans What-If : ruptures → NO-GO
+    return ("NO-GO", "#dc2626",
+            f"{nr} semaine(s) avec stock negatif — clients non livres. "
+            f"Activer un levier (HS, ST, anticipation) avant de valider.")
+
+def _orch_verdict_dem(arts):
+    """Retourne (verdict, couleur, explication courte)."""
+    if not arts:
+        return "N/D", "#6b7280", "Aucune donnee demande chargee."
+    mpy = sum(a["mape_py"] for a in arts) / len(arts)
+    if mpy > 25:
+        return ("NO-GO", "#dc2626",
+                f"MAPE moyen {mpy:.1f}% trop eleve — previsions peu fiables.")
+    if mpy > 15:
+        return ("GO CONDITIONNEL", "#d97706",
+                f"MAPE moyen {mpy:.1f}% — previsions acceptables, marge d'amelioration.")
+    return "GO", "#16a34a", f"MAPE moyen {mpy:.1f}% — previsions fiables."
 
 
 def _orch_build_report(data, scenario):
@@ -1890,26 +2205,16 @@ def _orch_build_report(data, scenario):
     out.append(f'<div class="ai" style="margin-bottom:.35rem;font-size:.76rem">'
                f'<strong>Scénario :</strong> {scenario}{sc_info}</div>')
 
-    # ── Bandeau contexte ──────────────────────────────────────────────────────
-    ctx_labels = {
-        "historique": ("📋 ANALYSE HISTORIQUE", "#1e3a8a",
-            "Ces données décrivent une période passée. "
-            "GO/NO-GO n'a pas de sens sur le passé — "
-            "l'analyse porte sur les causes et les leçons pour le prochain cycle S&OP."),
-        "plan": ("📅 PLAN PRÉVISIONNEL", "#16a34a",
-            "Ces données représentent un plan futur à valider. "
-            "Le verdict GO/NO-GO indique si le plan est réalisable tel quel."),
-        "ambigu": ("⚠ CONTEXTE INDÉTERMINÉ", "#d97706",
-            "Impossible de déterminer si ces données sont historiques ou prévisionnelles. "
-            "L'analyse est fournie sous les deux angles."),
-    }
-    ctx_lbl, ctx_col, ctx_msg = ctx_labels[contexte]
-    out.append(f"""
-<div style="background:#f0f2f7;border-left:4px solid {ctx_col};border-radius:6px;
-  padding:.5rem .8rem;margin-bottom:.4rem">
-  <div style="font-weight:800;font-size:.78rem;color:{ctx_col};
-    font-family:JetBrains Mono,monospace;margin-bottom:.1rem">{ctx_lbl}</div>
-  <div style="font-size:.77rem;color:#374151;line-height:1.6">{ctx_msg}</div>
+    # ── Bandeau Plan Prévisionnel (toutes les données sont actuelles) ─────────
+    out.append("""
+<div style="background:#f0fdf4;border-left:4px solid #16a34a;border-radius:6px;
+  padding:.4rem .8rem;margin-bottom:.4rem">
+  <div style="font-weight:800;font-size:.78rem;color:#16a34a;
+    font-family:JetBrains Mono,monospace;margin-bottom:.05rem">📅 PLAN PRÉVISIONNEL</div>
+  <div style="font-size:.75rem;color:#374151">
+    Ces données représentent un plan à valider. Le verdict GO/NO-GO indique si le plan
+    est réalisable tel quel ou sous conditions.
+  </div>
 </div>""")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2165,180 +2470,223 @@ def _orch_build_report(data, scenario):
 
 
 def orchestrate(scenario="SITUATION NOMINALE"):
-    """Analyse S&OP — détecte le contexte des données avant de raisonner."""
+    """Analyse S&OP avec discussion inter-agents claire et LLM pour la justification."""
     disc = []
     ts = lambda: datetime.now().strftime("%H:%M:%S")
     def add(ag, c):
         disc.append({"agent": ag, "content": c, "ts": ts()})
         st.session_state.disc = disc.copy()
 
-    add("ORCH", f"<strong>Scénario :</strong> {scenario} — Lecture et analyse des données...")
+    add("ORCH", f"Lancement de l'analyse S&OP — <strong>Scénario : {scenario}</strong>")
     data = _orch_collect_data()
+    p    = data["production"]
+    arts = data["demande"]
+    fin  = data["finance"]
 
-    # ── Résumé factuel par agent ──────────────────────────────────────────────
-    p = data["production"]
-    if p:
-        add("PRODUCTION",
-            f"<strong>Lu :</strong> {p['weeks_total']} sem | "
-            f"Cap {p['cap_v']:.0f} PHR = {p['max_u']:.0f} U/sem<br>"
-            f"Surcharges : <strong>{p['n_surcharge']}/{p['weeks_total']}</strong> | "
-            f"Sat max : <strong>{p['sat_max']:.0f}%</strong> | "
-            f"Stock min : <strong>{p['stock_min']:,.0f} U</strong>")
+    # ── Afficher les erreurs de chargement de scénarios ───────────────────
+    if data.get("errors"):
+        for err in data["errors"]:
+            add("ORCH", f"<div style='background:#fef2f2;border-left:3px solid #dc2626;"
+                        f"border-radius:4px;padding:.3rem .6rem;font-size:.75rem'>"
+                        f"⚠ {err}</div>")
+
+    # ── Confirmer les scénarios actifs ────────────────────────────────────
+    sc_actifs_log = data.get("scenarios_actifs", {})
+    if sc_actifs_log:
+        sc_txt_log = " | ".join(f"<strong>{k}</strong> : {v}" for k,v in sc_actifs_log.items())
+        add("ORCH", f"<div style='background:#eff6ff;border-left:3px solid #2563eb;"
+                    f"border-radius:4px;padding:.3rem .6rem;font-size:.75rem'>"
+                    f"📐 Scenarios What-If lus et appliques : {sc_txt_log}</div>")
     else:
-        add("PRODUCTION", "Aucun fichier chargé.")
+        add("ORCH", "<div style='font-size:.75rem;color:#6b7280'>"
+                    "Aucun scenario What-If actif — analyse en mode nominal.</div>")
 
-    for a in data["demande"][:4]:
-        add("DEMANDE",
-            f"<strong>{a['article'][:24]}</strong> | N={a['n']} | "
-            f"MAPE ERP <strong>{a['mape_erp']:.1f}%</strong> → "
-            f"Python <strong>{a['mape_py']:.1f}%</strong> ({a['methode']}) | "
-            f"Trend {a['trend']:+.1f}")
-    if not data["demande"]:
-        add("DEMANDE", "Aucun fichier chargé.")
+    # ── Messages inter-agents CLAIRS (lisibles par n'importe qui) ─────────────
+    # PRODUCTION
+    if p:
+        sat_max = p["sat_max"]
+        ns = p["n_surcharge"]; nw = p["weeks_total"]
+        mi = p["stock_min"]; nr = p["n_rupture"]
+        sc_prod = p.get("scenario","Nominal")
 
-    # ── Détection du contexte ─────────────────────────────────────────────────
-    contexte = _orch_detect_context(data)
-    ctx_msg = {"historique": "Données historiques détectées — analyse post-période.",
-               "plan": "Plan prévisionnel détecté — validation GO/NO-GO.",
-               "ambigu": "Contexte indéterminé — analyse factuelle."}
-    add("ORCH", f"<strong>Contexte détecté :</strong> {ctx_msg[contexte]}")
+        if sc_prod and sc_prod != "Nominal":
+            sc_info = f" <em>(scénario : {sc_prod})</em>"
+        else:
+            sc_info = ""
 
-    # ── Raisonnement ──────────────────────────────────────────────────────────
-    flags = _orch_detect_situation(data)
+        # Message simplifié et compréhensible
+        if ns == 0 and mi >= 0:
+            prod_msg = (f"La ligne de production Fill-L1 peut absorber toute la demande{sc_info}. "
+                        f"<strong>Aucune semaine en surcharge</strong>. "
+                        f"Le stock reste positif à {mi:,.0f} U minimum. "
+                        f"<span style='color:#16a34a;font-weight:700'>Production : RAS.</span>")
+        elif ns > 0 and mi >= 0:
+            prod_msg = (f"La production est sous pression{sc_info} : "
+                        f"<strong style='color:#d97706'>{ns} semaine(s) sur {nw}</strong> "
+                        f"dépassent la capacité ({p['cap_v']:.0f} PHR/sem = {p['max_u']:.0f} U/sem). "
+                        f"Le stock reste positif ({mi:,.0f} U) — le risque est limité pour l'instant. "
+                        f"Saturation max : <strong>{sat_max:.0f}%</strong>. "
+                        f"<span style='color:#d97706;font-weight:700'>A surveiller.</span>")
+        else:
+            prod_msg = (f"<strong style='color:#dc2626'>Situation critique{sc_info}</strong> : "
+                        f"{ns}/{nw} semaines dépassent la capacité, dont {nr} semaines où "
+                        f"le stock passe négatif (<strong style='color:#dc2626'>{mi:,.0f} U</strong>). "
+                        f"Pic le plus élevé : {p['pic_w']} à {p['pic_dem']:,.0f} U/sem "
+                        f"= {sat_max:.0f}% de la capacité. "
+                        f"En clair : on ne peut pas livrer tous les clients sur ces {nr} semaines. "
+                        f"<span style='color:#dc2626;font-weight:700'>Action requise.</span>")
+        add("PRODUCTION", f"<div>{prod_msg}</div>")
+    else:
+        add("PRODUCTION", "<div>Aucun fichier production charge. Merci de charger un fichier dans l'onglet Production.</div>")
+
+    # DEMANDE
+    if arts:
+        for a in arts[:3]:
+            sc_dem = a.get("scenario","Auto")
+            mpy = a["mape_py"]; erp = a["mape_erp"]
+            trend = a["trend"]
+            gain = mpy - erp if erp > 0 else None
+
+            if mpy < 15:
+                qualite = f"<span style='color:#16a34a;font-weight:700'>très précise</span>"
+            elif mpy < 25:
+                qualite = f"<span style='color:#d97706;font-weight:700'>acceptable</span>"
+            else:
+                qualite = f"<span style='color:#dc2626;font-weight:700'>imprécise — à améliorer</span>"
+
+            trend_txt = (f"La demande <strong>croît de {abs(trend):.1f} U/mois</strong>." if trend > 5
+                         else f"La demande <strong>décline de {abs(trend):.1f} U/mois</strong> — signal d'alerte." if trend < -5
+                         else "La demande est <strong>stable</strong>.")
+
+            dem_msg = (f"<strong>{a['article'][:25]}</strong> "
+                       f"({a['n']} périodes) — "
+                       f"Prévision {qualite} : erreur moyenne {mpy:.1f}% "
+                       + (f"(gain de {gain:.1f} points vs ERP)" if gain and gain < 0 else "") + ". "
+                       + trend_txt
+                       + (f" Scénario : {sc_dem}." if sc_dem not in ("Auto","DEM_AUTO","") else ""))
+            add("DEMANDE", f"<div>{dem_msg}</div>")
+    else:
+        add("DEMANDE", "<div>Aucun fichier demande charge. Le plan de production ne peut pas etre valide sans previsions.</div>")
+
+    # FINANCE
+    if fin:
+        pt = fin["profit_total"]; nd = fin["n_deficit"]; nc = fin["n_critique"]
+        if nd == 0 and nc == 0:
+            fin_msg = (f"Portefeuille sain : profit total <strong>{pt:,.0f}</strong>. "
+                       f"Aucun produit déficitaire. "
+                       f"<span style='color:#16a34a;font-weight:700'>Finance : RAS.</span>")
+        elif nd > 0:
+            fin_msg = (f"<strong style='color:#dc2626'>{nd} produit(s) déficitaire(s)</strong> "
+                       f"(ils coûtent plus cher à produire qu'ils ne rapportent). "
+                       f"Profit total : <strong>{pt:,.0f}</strong>. "
+                       f"Attention : produire ces articles en plus grande quantité "
+                       f"<em>aggrave les pertes</em>. Révision tarifaire recommandée.")
+        else:
+            fin_msg = (f"Profit total : <strong>{pt:,.0f}</strong>. "
+                       f"{nc} produit(s) avec marge inférieure à 10% — "
+                       f"vulnérables à toute hausse de coût. À surveiller.")
+        add("FINANCE", f"<div>{fin_msg}</div>")
+
+    # ORCH — Raisonnement LLM clair
+    flags      = _orch_detect_situation(data)
     diagnostics, actions = _orch_reason(data, flags)
+    v_global, c_global   = _orch_verdict_global(flags)
 
-    raison_lines = []
-    for d in diagnostics:
-        icon = "✓" if d["statut"]=="OK" else ("⚠" if d["statut"]=="ATTENTION" else "✗")
-        raison_lines.append(
-            f'<div style="padding:.12rem 0">'
-            f'<span style="color:{d["col"]};font-weight:700">{icon} {d["domaine"]}</span> : '
-            f'{d["analyse"]}'
-            f'{"<br><em style=\'color:#1e3a8a\'>→ "+d["action"]+"</em>" if d["action"] else ""}'
-            f'</div>')
-    if raison_lines:
-        add("ORCH", "".join(raison_lines))
+    # Construire un résumé factuel compact pour le LLM
+    facts = []
+    if p:
+        facts.append(f"Production: {p['n_surcharge']}/{p['weeks_total']} surcharges, "
+                     f"stock min {p['stock_min']:,.0f}U, sat max {p['sat_max']:.0f}%")
+        if p.get("scenario","Nominal") != "Nominal":
+            facts.append(f"Scenario actif: {p['scenario']}")
+    if arts:
+        mpy_avg = round(sum(a["mape_py"] for a in arts)/len(arts),1)
+        facts.append(f"Demande: MAPE moyen {mpy_avg}%, {sum(1 for a in arts if a['trend']<-5)} article(s) en declin")
+    if fin:
+        facts.append(f"Finance: {fin['n_deficit']} deficit(s), profit {fin['profit_total']:,.0f}")
+
+    wi_txt = ""
+    sc_actifs = data.get("scenarios_actifs",{})
+    if sc_actifs:
+        wi_txt = " Scenarios What-If actifs: " + " | ".join(f"{k}:{v}" for k,v in sc_actifs.items())
+
+    # ── LLM — raisonnement ancré dans les chiffres réels ─────────────────────
+    # Construire un contexte riche et SPÉCIFIQUE pour que le LLM raisonne vraiment
+    ctx_prod = ""
+    ctx_dem  = ""
+    ctx_wi   = ""
+    ctx_fin  = ""
+
+    if p:
+        ctx_prod = (f"Production : {p['n_surcharge']}/{p['weeks_total']} semaines en surcharge "
+                    f"(saturation max {p['sat_max']:.0f}% en {p['pic_w']}). "
+                    f"Stock minimum : {p['stock_min']:,.0f} U sur {p['n_rupture']} semaines. "
+                    f"Capacite : {p['cap_v']:.0f} PHR/sem = {p['max_u']:.0f} U/sem max. "
+                    f"Pic de demande : {p['pic_dem']:,.0f} U/sem "
+                    f"= {round(p['pic_dem']/p['max_u'],1) if p['max_u']>0 else '?'}x la capacite.")
+
+    if arts:
+        art_details = " | ".join(
+            f"{a['article'][:20]} "
+            f"MAPE={a['mape_py']:.1f}% ({a['methode']}) "
+            f"tendance={'+' if a['trend']>=0 else ''}{a['trend']:+.1f} U/periode "
+            f"(N={a.get('n','-')} periodes)"
+            for a in arts)
+        ctx_dem = f"Demande : {art_details}."
+
+    if sc_actifs:
+        ctx_wi = ("Scenarios What-If actifs : "
+                  + " | ".join(f"{k} = {v}" for k,v in sc_actifs.items())
+                  + ".")
+    else:
+        ctx_wi = "Aucun scenario What-If actif — analyse en mode nominal."
+
+    if fin:
+        ctx_fin = (f"Finance : profit {fin['profit_total']:,.0f}, "
+                   f"{fin['n_deficit']} produit(s) deficitaire(s).")
+
+    situation_complete = " ".join(filter(None, [ctx_prod, ctx_dem, ctx_wi, ctx_fin]))
+
+    llm_prompt = (
+        f"Tu es le directeur S&OP d'une entreprise industrielle. "
+        f"Voici la situation exacte ce mois-ci : {situation_complete} "
+        f"Le systeme a calcule le verdict : {v_global}. "
+        f"En 2 phrases maximum, dis clairement : "
+        f"(1) pourquoi cette situation aboutit a ce verdict en citant les chiffres cles, "
+        f"(2) quelle est l'action la plus urgente a prendre. "
+        f"NE PAS utiliser de liste numerotee. "
+        f"Parle comme un directeur industriel, pas comme un consultant. "
+        f"Sois direct et precis."
+    )
+
+    try:
+        justification = groq("Expert S&OP. Reponds UNIQUEMENT en francais. Utilise les chiffres exacts fournis. Ne dis jamais de pourcentage pour la tendance si elle est en U/periode.", llm_prompt, 180)
+        # Nettoyer les listes numérotées si le LLM en produit quand même
+        import re as _re
+        justification = _re.sub(r"^[0-9]+\.\s*", "", justification, flags=_re.MULTILINE)
+        justification = justification.replace("\n", " ").strip()
+    except Exception:
+        justification = (f"{ctx_prod} {ctx_wi} Verdict : {v_global}.")
+
+    add("ORCH", f"""
+<div style="background:#f0f2f7;border-left:4px solid #1e3a8a;border-radius:6px;padding:.5rem .8rem">
+  <div style="font-weight:700;font-size:.75rem;color:#1e3a8a;margin-bottom:.25rem">
+    Verdict : <span style="color:{c_global}">{v_global}</span>
+  </div>
+  <div style="font-size:.79rem;color:#374151;line-height:1.65">{justification}</div>
+</div>""")
 
     # ── Rapport final ─────────────────────────────────────────────────────────
-    add("ORCH", "Construction du rapport...")
+    add("ORCH", "Construction du rapport complet...")
     rapport = _orch_build_report(data, scenario)
     disc[-1]["content"] = rapport
     st.session_state.disc = disc.copy()
 
-    # ── Email automatique si problème critique ────────────────────────────────
+    # ── Email automatique ─────────────────────────────────────────────────────
     try:
         _auto_email_check(trigger="Analyse S&OP Orchestrateur", agent="orchestrateur")
     except Exception:
         pass
-
-    flags = _orch_detect_situation(data)
-    diagnostics, actions = _orch_reason(data, flags)
-    v_global, c_global = _orch_verdict_global(flags)
-    out = []
-
-    # ── Bandeau scénario + scénarios agents actifs ───────────────────────────
-    sc_actifs = data.get("scenarios_actifs", {})
-    sc_lines = []
-    if sc_actifs.get("production"):
-        sc_lines.append(f"Production : <strong>{sc_actifs['production']}</strong>")
-    if sc_actifs.get("demande"):
-        sc_lines.append(f"Demande : <strong>{sc_actifs['demande']}</strong>")
-    sc_info = (" | Scénarios What-If actifs : " + " | ".join(sc_lines)) if sc_lines else ""
-    out.append(f'<div class="ai" style="margin-bottom:.3rem">'
-               f'<strong>Scénario :</strong> {scenario}{sc_info}</div>')
-
-    # ── Verdict global ────────────────────────────────────────────────────────
-    n_actions = len(actions)
-    if v_global == "GO" and n_actions == 0:
-        verdict_detail = "Tous les indicateurs sont dans les objectifs. Aucune action corrective requise."
-    elif v_global == "GO" and n_actions > 0:
-        verdict_detail = (f"{n_actions} opportunité(s) d'amélioration identifiée(s) "
-                          f"(non bloquantes pour le plan).")
-    elif v_global == "GO CONDITIONNEL":
-        verdict_detail = (f"{n_actions} action(s) à réaliser en séquence avant de valider le plan. "
-                          f"Ne pas combiner toutes les actions simultanément.")
-    else:
-        verdict_detail = (f"Plan non validé en l'état. {n_actions} action(s) corrective(s) "
-                          f"obligatoires. Voir le plan d'action ci-dessous.")
-
-    out.append(f"""
-<div style="background:#f8f9fc;border:2px solid {c_global};border-radius:8px;
-  padding:.65rem .9rem;margin:.3rem 0">
-  <div style="font-size:.68rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
-    color:var(--mu);font-family:JetBrains Mono,monospace;margin-bottom:.2rem">Verdict S&OP</div>
-  <div style="font-size:1.05rem;font-weight:900;color:{c_global};margin-bottom:.18rem">{v_global}</div>
-  <div style="font-size:.78rem;color:#374151;line-height:1.6">{verdict_detail}</div>
-</div>""")
-
-    # ── Bilan par domaine ─────────────────────────────────────────────────────
-    bilan_rows = []
-    for d in diagnostics:
-        statut_html = f'<span style="color:{d["col"]};font-weight:700">{d["statut"]}</span>'
-        action_txt = d["action"] if d["action"] else "Aucune action requise"
-        bilan_rows.append([d["domaine"], d["analyse"], statut_html, action_txt])
-    if bilan_rows:
-        out.append(T(["Domaine","Situation analysée","Statut","Orientation"],
-                     bilan_rows, None,
-                     "Analyse par domaine — raisonnement basé sur les données réelles"))
-
-    # ── Risques ───────────────────────────────────────────────────────────────
-    risques = []
-    p = data["production"]; arts = data["demande"]; fin = data["finance"]
-    if p:
-        if flags.get("prod_sat_extreme"):
-            risques.append(("CRITIQUE", "#dc2626",
-                f"Saturation extrême {p['sat_max']:.0f}% en {p['pic_w']} "
-                f"({p['pic_dem']:,.0f} U/sem). Rupture stock garantie sans action externe."))
-        elif flags.get("prod_surcharge"):
-            risques.append(("IMPORTANT", "#d97706",
-                f"{p['n_surcharge']}/{p['weeks_total']} semaines en surcharge. "
-                f"Stock min {p['stock_min']:,.0f} U."))
-    if arts and flags.get("dem_volatile"):
-        cv_avg = round(sum(a["cv"] for a in arts)/len(arts), 0)
-        risques.append(("IMPORTANT", "#d97706",
-            f"Séries volatiles (CV moyen {cv_avg:.0f}%) — prévisions à risque élevé."))
-    if arts and flags.get("dem_tendance_baisse"):
-        n_dec = sum(1 for a in arts if a["trend"] < -10)
-        risques.append(("IMPORTANT", "#d97706",
-            f"{n_dec} article(s) en déclin structurel — réduire les ordres de production."))
-    if fin and flags.get("fin_deficit"):
-        risques.append(("IMPORTANT", "#d97706",
-            f"{fin['n_deficit']} produit(s) déficitaire(s) — produire ces références aggrave les pertes."))
-    if not risques:
-        risques.append(("MINEUR", "#16a34a", "Aucun risque critique identifié."))
-
-    risk_rows = [[f'<span style="color:{r[1]};font-weight:700">{r[0]}</span>', r[2]]
-                 for r in risques]
-    out.append(T(["Niveau","Risque identifié"], risk_rows, None, "Risques S&OP"))
-
-    # ── Plan d'action ─────────────────────────────────────────────────────────
-    if actions:
-        action_rows = [
-            [f"Étape {a['prio']}", a["resp"], a["action"], a["delai"], a["condition"]]
-            for a in sorted(actions, key=lambda x: x["prio"])
-        ]
-        out.append(T(
-            ["Étape","Responsable","Action spécifique et justifiée","Délai","Condition de passage"],
-            action_rows, None,
-            "Plan d'action S&OP — séquence (chaque étape uniquement si la précédente est insuffisante)"
-        ))
-        out.append(f'<div class="ai" style="margin-top:.25rem">'
-                   f'<strong>Règle d\'exécution :</strong> réaliser l\'Étape 1 en premier. '
-                   f'Ne passer à l\'Étape 2 que si l\'Étape 1 est insuffisante. '
-                   f'Ne jamais combiner toutes les actions simultanément.</div>')
-    else:
-        out.append(f'<div class="ag">Plan S&OP validé — aucune action corrective requise.</div>')
-
-    # ── Données manquantes ────────────────────────────────────────────────────
-    missing = []
-    if not p: missing.append("Production")
-    if not arts: missing.append("Demande")
-    if not fin: missing.append("Finance")
-    if missing:
-        out.append(f'<div class="aw"><strong>Données manquantes :</strong> {", ".join(missing)} '
-                   f'— charger les fichiers pour un rapport complet.</div>')
-
-    return "".join(out)
 # ── RENDER CHAT ────────────────────────────────────────────────────────────────
 def _build_chat_html(agent):
     """
@@ -2539,9 +2887,15 @@ def render_definitions(agent):
             )
 
 def prod_mrp(dfs, q=""):
-    mrp = mrp_calc(dfs, {})
-    ov = parse_ov(q, mrp["weeks"]) if q else {}
-    if ov: mrp = mrp_calc(dfs, ov)
+    # Lire le scénario What-If actif SAUF si un override explicite (q) est passé
+    if q and q.strip():
+        mrp = mrp_calc(dfs, {})
+        ov = parse_ov(q, mrp["weeks"]) if q else {}
+        if ov: mrp = mrp_calc(dfs, ov)
+        cap_active = mrp["p"]["cap_v"]
+        sc_label   = ""
+    else:
+        mrp, cap_active, sc_label = _get_active_mrp(dfs)
     p=mrp["p"]; W=mrp["weeks"]
     n_s=sum(1 for x in mrp["status"] if x=="SURCHARGE")
     n_a=sum(1 for x in mrp["status"] if x=="ALERTE")
@@ -2685,15 +3039,18 @@ def prod_mrp(dfs, q=""):
 
 
 def prod_surcharges(dfs):
-    mrp=mrp_calc(dfs,{}); p=mrp["p"]; W=mrp["weeks"]
+    mrp, cap_active, sc_label = _get_active_mrp(dfs)
+    p=mrp["p"]; W=mrp["weeks"]
+    var_v=p["var_v"]
+    hs25=round(cap_active*1.25/var_v,0) if var_v>0 else cap_active
+    hs50=round(cap_active*1.50/var_v,0) if var_v>0 else cap_active
     surge=[(i,W[i]) for i in range(len(W)) if mrp["status"][i]=="SURCHARGE"]
     if not surge: return '<div class="ag"><strong>Aucune surcharge</strong> sur les periodes. Capacite suffisante.</div>'
-    hs25=round(p["cap_v"]*1.25/p["var_v"],0) if p["var_v"]>0 else p["cap_v"]; hs50=round(p["cap_v"]*1.5/p["var_v"],0) if p["var_v"]>0 else p["cap_v"]
     hd=["Periode","Gross Req","Charge PHR","Cap PHR","Deficit PHR","Sat %","Deficit U","HS+25%?","HS+50%?"]
     rows=[]; cls=[]
     for i,w in enumerate(W):
         if mrp["status"][i]!="SURCHARGE": continue
-        wl=w.replace(" Y23",""); du=round(abs(mrp["surplus"][i])/p["var_v"],0) if p["var_v"]>0 else 0
+        wl=w.replace(" Y23",""); du=round(abs(mrp["surplus"][i])/var_v,0) if var_v>0 else 0
         ok25="OUI" if hs25>=mrp["gross"][i] else "NON"
         ok50="OUI" if hs50>=mrp["gross"][i] else "NON"
         c25=f'<span style="color:{"#16a34a" if ok25=="OUI" else "#dc2626"};font-weight:700">{ok25}</span>'
@@ -2746,102 +3103,157 @@ Cette simulation teste la robustesse du plan face a un pic de demande imprevvu.
     return "".join(out)
 
 
+def _get_active_mrp(dfs):
+    """
+    Retourne le MRP calculé avec le scénario What-If actif de la session.
+    Si aucun scénario actif → retourne le MRP nominal.
+    Utilisé par TOUTES les fonctions production pour être cohérent avec le panneau latéral.
+    """
+    mrp_base = mrp_calc(dfs, {})
+    p_base   = mrp_base["p"]
+    wp = st.session_state.get("whatif_params", {})
+    sc = wp.get("production", {}).get("sc_txt", "NOMINAL")
+
+    if not sc or sc == "NOMINAL":
+        return mrp_base, p_base["cap_v"], ""
+
+    try:
+        new_cap, minprod, sc_label = _parse_prod_scenario(sc, p_base["cap_v"])
+        mrp_sc = _mrp_calc_with_new_cap(
+            mrp_base, new_cap, p_base["var_v"], p_base["ss_v"], p_base["bat_v"],
+            minprod=minprod)
+        return mrp_sc, new_cap, sc_label
+    except Exception:
+        return mrp_base, p_base["cap_v"], ""
+
+
+def _sc_banner(sc_label, cap_nom, cap_sc, var_v):
+    """Bandeau visuel indiquant le scénario What-If actif dans les analyses."""
+    if not sc_label:
+        return ""
+    max_nom = round(cap_nom / var_v, 0) if var_v > 0 else cap_nom
+    max_sc  = round(cap_sc  / var_v, 0) if var_v > 0 else cap_sc
+    return (f'<div style="background:#eff6ff;border:1.5px solid #2563eb;border-radius:6px;'
+            f'padding:.35rem .65rem;margin:.2rem 0;font-size:.76rem">'
+            f'<strong style="color:#1e3a8a">📐 Scénario actif : {sc_label}</strong> — '
+            f'Capacité : {cap_nom:.0f} PHR → <strong>{cap_sc:.0f} PHR/sem</strong> = '
+            f'<strong>{max_sc:.0f} U/sem</strong> (vs {max_nom:.0f} U/sem nominal)'
+            f'</div>')
+
+
 def prod_hs_calc(dfs):
     """
-    Calcule précisément le nombre d'heures supplémentaires nécessaires semaine par semaine.
-    Répond à : 'combien d'heures supplémentaires ?'
-    Formule : PHR déficit = Charge PHR - Capacité PHR
-              HS% nécessaire = Déficit / Capacité × 100
-    Montre ce que HS+25% et HS+50% couvrent réellement.
+    Calcule les heures supplémentaires nécessaires semaine par semaine.
+    Utilise le scénario What-If actif (Cap -X%, Cap +X%, etc.) si configuré.
+    Formule : PHR déficit = Charge PHR - Capacité active (pas toujours nominale !)
+              HS% nécessaire = Déficit / Capacité active × 100
     """
-    mrp=mrp_calc(dfs,{}); p=mrp["p"]; W=mrp["weeks"]
-    cap=p["cap_v"]; var_v=p["var_v"]; max_u=p["max_u"]
-    cap_hs25=cap*1.25; cap_hs50=cap*1.5
-    max_hs25=round(cap_hs25/var_v,0) if var_v>0 else cap_hs25; max_hs50=round(cap_hs50/var_v,0) if var_v>0 else cap_hs50
-    out=[]
+    mrp, cap_active, sc_label = _get_active_mrp(dfs)
+    p = mrp["p"]; W = mrp["weeks"]
+    cap_nom = p["cap_v"]   # toujours la nominale pour référence
+    var_v   = p["var_v"]
+    max_u   = round(cap_active / var_v, 0) if var_v > 0 else cap_active
 
-    # Contexte
+    # HS calculées sur la capacité ACTIVE (pas toujours nominale)
+    cap_hs25 = cap_active * 1.25
+    cap_hs50 = cap_active * 1.50
+    max_hs25 = round(cap_hs25 / var_v, 0) if var_v > 0 else cap_hs25
+    max_hs50 = round(cap_hs50 / var_v, 0) if var_v > 0 else cap_hs50
+
+    delta_phr  = cap_hs25 - cap_active  # PHR gagnés par +25% HS
+    delta_u25  = max_hs25 - max_u
+    delta_u50  = max_hs50 - max_u
+    out = []
+
+    # Bandeau scénario actif
+    if sc_label:
+        out.append(_sc_banner(sc_label, cap_nom, cap_active, var_v))
+
     out.append(f"""
 <div class="ai">
 <strong>Definition — Heures Supplementaires (HS)</strong><br>
-La capacite nominale de Fill-L1 est <strong>{cap:.0f} PHR/semaine</strong> ({max_u:.0f} U/sem).<br>
-HS +25% → {cap_hs25:.0f} PHR/sem → <strong>{max_hs25:.0f} U/sem</strong> maximum (+350 PHR, +750 U).<br>
-HS +50% → {cap_hs50:.0f} PHR/sem → <strong>{max_hs50:.0f} U/sem</strong> maximum (+700 PHR, +1500 U).<br>
-<strong>Formule :</strong> Déficit PHR = Charge PHR - Capacité PHR | HS% nécessaire = Déficit / Capacité × 100
+{"<strong style='color:#dc2626'>ATTENTION : capacite active = " + f"{cap_active:.0f} PHR/sem (scenario {sc_label})</strong>, pas la nominale " + f"({cap_nom:.0f} PHR).<br>" if sc_label else ""}
+Capacite active Fill-L1 : <strong>{cap_active:.0f} PHR/semaine</strong> ({max_u:.0f} U/sem).<br>
+HS +25% sur cap. active → {cap_hs25:.0f} PHR/sem → <strong>{max_hs25:.0f} U/sem</strong> (+{delta_phr:.0f} PHR, +{delta_u25:.0f} U).<br>
+HS +50% sur cap. active → {cap_hs50:.0f} PHR/sem → <strong>{max_hs50:.0f} U/sem</strong> (+{cap_hs50-cap_active:.0f} PHR, +{delta_u50:.0f} U).<br>
+<strong>Formule :</strong> Déficit PHR = Charge PHR - Capacité active | HS% = Déficit / Cap. active × 100
 </div>""")
 
-    hd=["Semaine","Demande [U]","Charge [PHR]","Cap. nom. [PHR]","Deficit [PHR]","HS% necessaire",
-        "HS+25% suffit ?","HS+50% suffit ?","ST si HS+50%"]
-    rows=[]; cls_r=[]
-    total_phr_def=0; total_st_hs50=0
-    n_hs25_ok=0; n_hs50_ok=0; n_impossible=0
-    for i,w in enumerate(W):
-        wl=w.replace(" Y23","")
-        g=mrp["gross"][i]; ch=mrp["charge"][i]; surp=mrp["surplus"][i]
-        deficit=max(0.0,-surp)
-        if deficit<=0:
-            rows.append([wl,f"{g:,.0f}",f"{ch:,.1f}",f"{cap:.0f}","0","0%",
-                         "n/a","n/a","0"])
+    hd = ["Semaine","Demande [U]","Charge [PHR]",f"Cap. active [PHR]","Deficit [PHR]",
+          "HS% necessaire","HS+25% suffit ?","HS+50% suffit ?","ST si HS+50%"]
+    rows = []; cls_r = []
+    total_phr_def = 0; total_st_hs50 = 0
+    n_hs25_ok = 0; n_hs50_ok = 0; n_impossible = 0
+
+    for i, w in enumerate(W):
+        wl = w.replace(" Y23", "")
+        g  = mrp["gross"][i]
+        ch = mrp["charge"][i]
+        # Déficit par rapport à la capacité ACTIVE
+        deficit = max(0.0, ch - cap_active)
+        if deficit <= 0:
+            rows.append([wl, f"{g:,.0f}", f"{ch:,.1f}", f"{cap_active:.0f}",
+                         "0", "0%", "n/a", "n/a", "0"])
             cls_r.append("")
             continue
-        hs_pct_needed=round(deficit/cap*100,1)
-        ok25="OUI" if ch<=cap_hs25 else "NON"
-        ok50="OUI" if ch<=cap_hs50 else "NON"
-        st_hs50=max(0.0,g-max_hs50) if ok50=="NON" else 0
-        total_phr_def+=deficit; total_st_hs50+=st_hs50
-        if ok25=="OUI": n_hs25_ok+=1
-        if ok50=="OUI": n_hs50_ok+=1
-        if ok50=="NON": n_impossible+=1
-        c25=f'<span style="color:{"#16a34a" if ok25=="OUI" else "#dc2626"};font-weight:700">{ok25}</span>'
-        c50=f'<span style="color:{"#16a34a" if ok50=="OUI" else "#dc2626"};font-weight:700">{ok50}</span>'
-        rows.append([wl,f"{g:,.0f}",f"{ch:,.1f}",f"{cap:.0f}",
+        hs_pct = round(deficit / cap_active * 100, 1)
+        ok25 = "OUI" if ch <= cap_hs25 else "NON"
+        ok50 = "OUI" if ch <= cap_hs50 else "NON"
+        st_hs50 = max(0.0, g - max_hs50) if ok50 == "NON" else 0
+        total_phr_def += deficit
+        total_st_hs50 += st_hs50
+        if ok25 == "OUI": n_hs25_ok += 1
+        if ok50 == "OUI": n_hs50_ok += 1
+        if ok50 == "NON": n_impossible += 1
+        c25 = f'<span style="color:{"#16a34a" if ok25=="OUI" else "#dc2626"};font-weight:700">{ok25}</span>'
+        c50 = f'<span style="color:{"#16a34a" if ok50=="OUI" else "#dc2626"};font-weight:700">{ok50}</span>'
+        pct_col = "#dc2626" if hs_pct > 100 else "#d97706" if hs_pct > 50 else "#16a34a"
+        rows.append([wl, f"{g:,.0f}", f"{ch:,.1f}", f"{cap_active:.0f}",
                      f"<strong>{deficit:,.1f}</strong>",
-                     f'<span style="color:{"#dc2626" if hs_pct_needed>50 else "#d97706"};font-weight:700">{hs_pct_needed:.0f}%</span>',
-                     c25,c50,f"{st_hs50:,.0f}" if st_hs50>0 else "0"])
+                     f'<span style="color:{pct_col};font-weight:700">{hs_pct:.0f}%</span>',
+                     c25, c50, f"{st_hs50:,.0f}" if st_hs50 > 0 else "0"])
         cls_r.append("surge")
-    out.append(T(hd,rows,cls_r,"Analyse Heures Supplementaires — semaine par semaine"))
 
-    # Verdict HS
-    if n_hs25_ok>0:
-        bilan_hs25=f"HS +25% resout {n_hs25_ok} semaine(s) en surcharge."
-    else:
-        bilan_hs25="HS +25% ne resout AUCUNE semaine en surcharge sur ce plan."
-    if n_hs50_ok>0:
-        bilan_hs50=f"HS +50% resout {n_hs50_ok} semaine(s) en surcharge."
-    else:
-        bilan_hs50="HS +50% ne resout AUCUNE semaine en surcharge."
+    out.append(T(hd, rows, cls_r,
+        f"Analyse HS — cap. active {cap_active:.0f} PHR/sem"
+        + (f" (scenario {sc_label})" if sc_label else " (nominale)")))
 
-    st_sans_hs=sum(max(0.0,mrp["gross"][i]-max_u) for i in range(len(W)))
+    # Synthèse
+    bilan_hs25 = (f"HS +25% resout {n_hs25_ok} semaine(s)." if n_hs25_ok > 0
+                  else "HS +25% ne resout AUCUNE semaine sur ce plan.")
+    bilan_hs50 = (f"HS +50% resout {n_hs50_ok} semaine(s)." if n_hs50_ok > 0
+                  else "HS +50% ne resout AUCUNE semaine.")
+    st_sans_hs = sum(max(0.0, mrp["gross"][i] - max_u) for i in range(len(W)))
 
-    out.append(S("Analyse Heures Supplementaires",[
-        f"• Cap. nominale : <strong>{cap:.0f} PHR/sem = {max_u:.0f} U/sem</strong>.",
-        f"• HS +25% : +350 PHR/sem → <strong>{max_hs25:.0f} U/sem</strong>. {bilan_hs25}",
-        f"• HS +50% : +700 PHR/sem → <strong>{max_hs50:.0f} U/sem</strong>. {bilan_hs50}",
-        f"• Deficit PHR cumulé (toutes semaines en surcharge) : <strong>{total_phr_def:,.0f} PHR</strong>.",
-        f"• Semaines impossibles meme avec HS+50% : <strong>{n_impossible}</strong> "
-          f"(pics de demande trop eleves pour tout levier interne).",
+    out.append(S("Analyse Heures Supplementaires", [
+        f"• Cap. active : <strong>{cap_active:.0f} PHR/sem = {max_u:.0f} U/sem</strong>"
+          + (f" (scenario : {sc_label})" if sc_label else " (nominale)"),
+        f"• HS +25% sur cap. active : +{delta_phr:.0f} PHR/sem → <strong>{max_hs25:.0f} U/sem</strong>. {bilan_hs25}",
+        f"• HS +50% sur cap. active : +{cap_hs50-cap_active:.0f} PHR/sem → <strong>{max_hs50:.0f} U/sem</strong>. {bilan_hs50}",
+        f"• Deficit PHR cumule (toutes semaines en surcharge) : <strong>{total_phr_def:,.0f} PHR</strong>.",
+        f"• Semaines impossibles meme avec HS+50% : <strong>{n_impossible}</strong>.",
         f"• ST residuelle sans HS : <strong>{st_sans_hs:,.0f} U</strong> | avec HS+50% : <strong>{total_st_hs50:,.0f} U</strong>.",
     ]))
 
-    # Conseil final
     if n_impossible > 0:
+        econ = st_sans_hs - total_st_hs50
         out.append(f"""
 <div style="background:#fef2f2;border:1.5px solid #dc2626;border-radius:8px;padding:.55rem .8rem;margin:.35rem 0">
   <div style="font-weight:700;font-size:.8rem;color:#991b1b;margin-bottom:.2rem">
-    Conclusion — Les heures supplementaires seules sont insuffisantes
+    Conclusion — HS insuffisantes seules
   </div>
   <div style="font-size:.79rem;color:#374151;line-height:1.65">
-    <strong>Pourquoi ?</strong> {n_impossible} semaine(s) ont une saturation si elevee
-    qu'aucun niveau de HS ne peut les couvrir (ex. pics a {max(mrp['gross']):.0f} U/sem vs max HS+50% = {max_hs50:.0f} U/sem).<br><br>
-    <strong>Recommandation en sequence :</strong><br>
-    1. Appliquer HS +50% pour les semaines partiellement couvertes → economise {st_sans_hs-total_st_hs50:,.0f} U de ST.<br>
-    2. Sous-traiter les <strong>{total_st_hs50:,.0f} U restantes</strong> sur {n_impossible} semaine(s) critique(s).<br>
-    3. Obtenir un devis fournisseur ST avant de valider — surcoût estimé +30-35% vs production interne.
+    <strong>Pourquoi ?</strong> {n_impossible} semaine(s) depassent toute capacite HS
+    (ex. pic {max(mrp['gross']):,.0f} U/sem vs max HS+50% = {max_hs50:.0f} U/sem sur cap. active {cap_active:.0f} PHR).<br><br>
+    <strong>Recommandation :</strong><br>
+    1. HS +50% sur semaines partiellement couvertes → economise <strong>{econ:,.0f} U</strong> de ST.<br>
+    2. Sous-traiter les <strong>{total_st_hs50:,.0f} U restantes</strong> sur {n_impossible} semaine(s).<br>
+    3. Obtenir un devis ST avant de valider (surcoût +30-35% vs production interne).
   </div>
 </div>""")
     else:
-        out.append(f'<div class="ag">Les HS seules suffisent a couvrir toutes les surcharges. '
-                   f'Aucune sous-traitance requise si HS acceptees par la RH.</div>')
+        out.append(f'<div class="ag">HS seules suffisent sur cap. active {cap_active:.0f} PHR/sem. '
+                   f'Aucune ST requise si HS validees par la RH.</div>')
     return "".join(out)
 
 
@@ -3131,6 +3543,22 @@ def _whatif_dem_result(dem, scenario):
         verdict_icon={"AMELIORATION":"OK","EQUIVALENT":"~","LEGER RECUL":"!","DEGRADATION":"X"}.get(wi["verdict"],"?")
 
         out.append(f'<div style="font-weight:700;color:var(--navy);margin:.3rem 0">{art[:30]}</div>')
+        # Verdict clair : OUI recommandé / NON dégradation / ~ équivalent
+        is_better  = d_mape < -2
+        is_worse   = d_mape > 2
+        is_neutral = not is_better and not is_worse
+
+        if is_better:
+            verdict_txt = f"✅ RECOMMANDE — le scenario ameliore la precision de {abs(d_mape):.1f} points."
+            verdict_col = "#16a34a"
+        elif is_neutral:
+            verdict_txt = f"~ EQUIVALENT — ecart de {abs(d_mape):.1f}% : les deux methodes sont comparables."
+            verdict_col = "#d97706"
+        else:
+            verdict_txt = (f"❌ NON RECOMMANDE — le scenario degrade la precision de {abs(d_mape):.1f} points. "
+                           f"La methode de reference ({ref_r.method}, MAPE {ref_r.mape:.1f}%) reste meilleure.")
+            verdict_col = "#dc2626"
+
         out.append(
             f'<div class="synth"><div class="synth-h">Comparaison methodes — MAPE plus bas = plus precis</div>'
             f'<div><strong>Methode de reference (recommandee)</strong> : {ref_r.method} — {ref_params}</div>'
@@ -3138,20 +3566,49 @@ def _whatif_dem_result(dem, scenario):
             f'<div style="margin-top:.2rem"><strong>Methode testee (scenario)</strong> : {scen_r.method} — {params_str}</div>'
             f'<div>MAPE scenario = <span style="color:{col_m};font-weight:700">{scen_r.mape:.1f}%</span> — '
             f'ecart : <span style="color:{col_m};font-weight:700">{d_mape:+.1f}%</span></div>'
-            f'<div style="margin-top:.15rem;font-weight:700;color:{verdict_color}">'
-            f'{verdict_icon} {wi["verdict"]}'
+            f'<div style="margin-top:.25rem;padding:.3rem .5rem;background:#f8f9fc;border-left:3px solid {verdict_col};border-radius:4px">'
+            f'<span style="font-weight:700;color:{verdict_col}">{verdict_txt}</span>'
             f'</div></div>'
         )
         hd=["Periode","Forecast Ref.","Forecast Scen.","Delta","Ecart %","Int. Bas (~85%)","Int. Haut (~85%)"]
         rows=[]
+
+        # ── Correction prévisions plates si tendance forte ────────────────────
+        r_data = dem.get(art, {})
+        v_hist  = r_data.get("hist", None)
+        tr_val  = r_data.get("trend", 0)
+        mn_val  = r_data.get("mean", 1)
+        rel_tr  = abs(tr_val) / mn_val if mn_val > 0 else 0
+
+        def _is_flat_fc(fc_list):
+            if not fc_list or len(fc_list) < 2: return True
+            return (max(fc_list) - min(fc_list)) <= max(1.0, 0.02 * abs(float(fc_list[0])))
+
+        def _lin_fc_from_hist(v_series, n_out=6):
+            if v_series is None or len(v_series) < 2: return None
+            v_arr = v_series.values if hasattr(v_series, 'values') else np.array(v_series)
+            slope, intercept = np.polyfit(np.arange(len(v_arr)), v_arr, 1)
+            return [max(0.0, round(intercept + slope * (len(v_arr) + i), 0))
+                    for i in range(1, n_out + 1)]
+
+        fc_ref_list  = list(ref_r.forecast)
+        fc_scen_list = list(scen_r.forecast)
+        lin_fc = _lin_fc_from_hist(v_hist) if v_hist is not None else None
+
+        if rel_tr > 0.10 and lin_fc:
+            if _is_flat_fc(fc_ref_list):
+                fc_ref_list = lin_fc
+            if _is_flat_fc(fc_scen_list):
+                fc_scen_list = lin_fc   # scénario LES plat → même correction
+
         for i in range(6):
-            fr=ref_r.forecast[i]; fs=scen_r.forecast[i]; delta=fs-fr
-            pct=round(delta/(fr+1e-9)*100,1)
-            col_delta="#16a34a" if abs(pct)<5 else "#d97706" if abs(pct)<15 else "#dc2626"
-            rows.append([f"M+{i+1}",f"{fr:,.0f}",f"{fs:,.0f}",
+            fr = fc_ref_list[i]; fs = fc_scen_list[i]; delta = fs - fr
+            pct = round(delta / (fr + 1e-9) * 100, 1)
+            col_delta = "#16a34a" if abs(pct)<5 else "#d97706" if abs(pct)<15 else "#dc2626"
+            rows.append([f"M+{i+1}", f"{fr:,.0f}", f"{fs:,.0f}",
                 f'<span style="color:{col_delta};font-weight:700">{delta:+,.0f}</span>',
                 f'<span style="color:{col_delta}">{pct:+.1f}%</span>',
-                f"{scen_r.intervals_low[i]:,.0f}",f"{scen_r.intervals_high[i]:,.0f}"])
+                f"{scen_r.intervals_low[i]:,.0f}", f"{scen_r.intervals_high[i]:,.0f}"])
         out.append(T(hd,rows,None,f"Forecast Avant/Apres — {art[:22]}"))
         out.append(S(f"Analyse {art[:22]}",[
             f"• MAPE reference ({ref_r.method}) : <strong>{ref_r.mape:.1f}%</strong>.",
@@ -3511,91 +3968,112 @@ def render_tab(agent):
         # HW sélectionné  → α + β + γ              (les trois ensemble)
         # Auto            → aucun paramètre        (optimisation automatique)
         elif agent in ("demande","marketing") and has:
-            method=st.radio("Methode",
-                            ["Auto (recommandee — MAPE min)",
-                             "Forcer MA (fenetre uniquement)",
-                             "Forcer LES (alpha seul)",
-                             "Forcer HW (alpha, beta, gamma)"],
-                            key=f"sc_meth_{agent}",label_visibility="collapsed")
+            # ══ SCÉNARIOS MÉTIER — MARKETING ══════════════════════════════════
+            if agent == "marketing":
+                scenario_mkt = st.radio(
+                    "Scenario Marketing",
+                    ["Nominal (aucun levier)",
+                     "Augmentation budget publicitaire",
+                     "Modification prix de vente",
+                     "Promotion saisonniere",
+                     "Lancement nouvelle gamme",
+                     "Expansion geographique"],
+                    key=f"sc_meth_{agent}", label_visibility="collapsed")
+                parts = []
+                if "budget" in scenario_mkt.lower():
+                    st.markdown('<div class="ai" style="font-size:.74rem">Simuler une hausse du budget pub '
+                                'et son impact sur la demande (+X%).</div>', unsafe_allow_html=True)
+                    boost = st.slider("Hausse de la demande estimee (%)", 5, 50, 15,
+                                      key=f"sc_mkt_boost_{agent}", label_visibility="collapsed")
+                    st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">+{boost}% sur tous les articles</div>',
+                                unsafe_allow_html=True)
+                    parts = [f"MKT_BUDGET_PLUS_{boost}"]
 
-            ma_w=None; alpha_val=None; beta_val=None; gamma_val=None
-            parts=[]
+                elif "prix" in scenario_mkt.lower():
+                    st.markdown('<div class="ai" style="font-size:.74rem">Simuler une hausse ou baisse '
+                                'de prix et son impact sur la demande.</div>', unsafe_allow_html=True)
+                    delta_prix = st.slider("Variation de prix (%)", -30, 30, -10,
+                                          key=f"sc_mkt_prix_{agent}", label_visibility="collapsed")
+                    # Elasticite prix classique : -1 -> hausse 10% = baisse 10% demande
+                    impact_dem = -delta_prix  # elasticite = -1 simplifiee
+                    st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">Prix {delta_prix:+.0f}% '
+                                f'-> demande estimee {impact_dem:+.0f}% (elasticite -1)</div>',
+                                unsafe_allow_html=True)
+                    parts = [f"MKT_PRIX_{delta_prix:+.0f}"]
 
-            # ── MA : fenêtre uniquement — AUCUN α/β/γ ──────────────────────
-            if "MA" in method:
-                st.markdown('<div class="ai" style="font-size:.74rem;margin-bottom:.18rem">'
-                            'MA — fenetre glissante uniquement. '
-                            'Aucun parametre alpha, beta ou gamma pour cette methode.</div>',
-                            unsafe_allow_html=True)
-                ma_w = st.slider("Fenetre w (nombre de periodes)", 2, 12, 3,
-                                 key=f"sc_ma_{agent}", label_visibility="collapsed")
-                st.markdown(f'<div style="font-size:.72rem;color:var(--mu);margin-top:.1rem">'
-                            f'w = {ma_w} periode(s) — moyenne des {ma_w} dernieres valeurs</div>',
-                            unsafe_allow_html=True)
-                parts.append(f"DEM_MA_{ma_w}")
+                elif "promo" in scenario_mkt.lower():
+                    st.markdown('<div class="ai" style="font-size:.74rem">Simuler une promotion '
+                                'saisonniere sur une periode cible.</div>', unsafe_allow_html=True)
+                    boost_promo = st.slider("Boost demande pendant la promo (%)", 10, 100, 30,
+                                            key=f"sc_mkt_promo_{agent}", label_visibility="collapsed")
+                    parts = [f"MKT_PROMO_PLUS_{boost_promo}"]
 
-            # ── LES : α uniquement — pas de β ni γ ─────────────────────────
-            elif "LES" in method:
-                st.markdown('<div class="ai" style="font-size:.74rem;margin-bottom:.18rem">'
-                            'LES — un seul parametre : <strong>alpha (α)</strong>. '
-                            'Beta et gamma ne s\'appliquent pas a LES.</div>',
-                            unsafe_allow_html=True)
-                alpha_val = st.slider("alpha (α) — reactivite au niveau", 0.05, 0.95, 0.3, 0.05,
-                                      key=f"sc_alpha_{agent}", label_visibility="collapsed")
-                if alpha_val > 0.6:
-                    label_a = "tres reactif — suit les variations recentes"
-                elif alpha_val > 0.35:
-                    label_a = "equilibre — poids modere au passe"
+                elif "gamme" in scenario_mkt.lower():
+                    st.markdown('<div class="ai" style="font-size:.74rem">Evaluer la charge additionnelle '
+                                'liee au lancement d\'un nouveau produit.</div>', unsafe_allow_html=True)
+                    vol_new = st.slider("Volume estime nouveau produit (U/mois)", 100, 5000, 500,
+                                        key=f"sc_mkt_gamme_{agent}", label_visibility="collapsed")
+                    parts = [f"MKT_GAMME_NEW_{vol_new}"]
+
+                elif "expansion" in scenario_mkt.lower():
+                    st.markdown('<div class="ai" style="font-size:.74rem">Simuler une expansion '
+                                'geographique et son impact sur les volumes totaux.</div>', unsafe_allow_html=True)
+                    mult = st.slider("Multiplicateur de volume (%)", 10, 100, 25,
+                                     key=f"sc_mkt_expand_{agent}", label_visibility="collapsed")
+                    parts = [f"MKT_EXPANSION_PLUS_{mult}"]
                 else:
-                    label_a = "stable — lisse les variations, privilege le long terme"
-                st.markdown(f'<div style="font-size:.72rem;color:var(--mu);margin-top:.1rem">'
-                            f'alpha = {alpha_val} — {label_a}</div>',
-                            unsafe_allow_html=True)
-                parts.append("DEM_LES")
-                parts.append(f"ALPHA_{alpha_val}")
+                    st.markdown('<div class="ag" style="font-size:.74rem">Mode nominal — '
+                                'analyse basee sur les donnees reelles.</div>', unsafe_allow_html=True)
 
-            # ── HW : α + β + γ — les trois obligatoires pour HW ───────────
-            elif "HW" in method:
-                st.markdown('<div class="ai" style="font-size:.74rem;margin-bottom:.18rem">'
-                            'HW — trois parametres : <strong>alpha</strong> (niveau), '
-                            '<strong>beta</strong> (tendance), <strong>gamma</strong> '
-                            '(saisonnalite F(n,k)).</div>',
-                            unsafe_allow_html=True)
-                # α
-                alpha_val = st.slider("alpha (α) — niveau", 0.05, 0.95, 0.3, 0.05,
-                                      key=f"sc_alpha_hw_{agent}", label_visibility="collapsed")
-                label_a = "tres reactif" if alpha_val > 0.6 else "equilibre" if alpha_val > 0.35 else "stable"
-                st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">alpha = {alpha_val} ({label_a})</div>',
-                            unsafe_allow_html=True)
-                # β
-                beta_val = st.slider("beta (β) — tendance", 0.01, 0.50, 0.10, 0.01,
-                                     key=f"sc_beta_{agent}", label_visibility="collapsed")
-                label_b = "reactif" if beta_val > 0.25 else "stable"
-                st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">beta = {beta_val} (tendance {label_b})</div>',
-                            unsafe_allow_html=True)
-                # γ
-                gamma_val = st.slider("gamma (γ) — saisonnalite F(n,k)", 0.01, 0.50, 0.10, 0.01,
-                                      key=f"sc_gamma_{agent}", label_visibility="collapsed")
-                label_g = "s'adapte vite" if gamma_val > 0.25 else "cycles stables"
-                st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">gamma = {gamma_val} ({label_g}) — facteurs F(n,k) HW uniquement</div>',
-                            unsafe_allow_html=True)
-                parts.append("DEM_HW")
-                parts.append(f"ALPHA_{alpha_val}")
-                parts.append(f"BETA_{beta_val}")
-                parts.append(f"GAMMA_{gamma_val}")
+                sc_txt = "+".join(parts) if parts else "MKT_NOMINAL"
 
-            # ── Auto : aucun paramètre à forcer ────────────────────────────
+            # ══ SCÉNARIOS MÉTHODE — DEMANDE ══════════════════════════════════
             else:
-                st.markdown('<div class="ag" style="font-size:.74rem">'
-                            'Auto : parametres optimises automatiquement (grille interne). '
-                            'Methode retenue = MAPE le plus bas parmi MA, LES et HW.</div>',
-                            unsafe_allow_html=True)
+                method=st.radio("Methode",
+                                ["Auto (recommandee — MAPE min)",
+                                 "Forcer MA (fenetre uniquement)",
+                                 "Forcer LES (alpha seul)",
+                                 "Forcer HW (alpha, beta, gamma)"],
+                                key=f"sc_meth_{agent}",label_visibility="collapsed")
+                ma_w=None; alpha_val=None; beta_val=None; gamma_val=None; parts=[]
 
-            sc_txt = "+".join(parts) if parts else "DEM_AUTO"
-            st.session_state.whatif_params["demande"] = {
-                "method": method, "alpha": alpha_val, "beta": beta_val,
-                "gamma": gamma_val, "ma_w": ma_w, "sc_txt": sc_txt}
-            if sc_txt != "DEM_AUTO":
+                if "MA" in method:
+                    st.markdown('<div class="ai" style="font-size:.74rem">MA — fenetre glissante. '
+                                'Aucun parametre alpha/beta/gamma.</div>', unsafe_allow_html=True)
+                    ma_w = st.slider("Fenetre w", 2, 12, 3, key=f"sc_ma_{agent}", label_visibility="collapsed")
+                    st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">w={ma_w} — '
+                                f'moyenne des {ma_w} dernieres valeurs</div>', unsafe_allow_html=True)
+                    parts.append(f"DEM_MA_{ma_w}")
+                elif "LES" in method:
+                    st.markdown('<div class="ai" style="font-size:.74rem">LES — alpha uniquement. '
+                                'Beta et gamma non applicables.</div>', unsafe_allow_html=True)
+                    alpha_val = st.slider("alpha (reacticvite)", 0.05, 0.95, 0.3, 0.05,
+                                          key=f"sc_alpha_{agent}", label_visibility="collapsed")
+                    st.markdown(f'<div style="font-size:.72rem;color:var(--mu)">alpha={alpha_val}</div>',
+                                unsafe_allow_html=True)
+                    parts.append("DEM_LES"); parts.append(f"ALPHA_{alpha_val}")
+                elif "HW" in method:
+                    st.markdown('<div class="ai" style="font-size:.74rem">HW — alpha + beta + gamma.</div>',
+                                unsafe_allow_html=True)
+                    alpha_val = st.slider("alpha (niveau)", 0.05, 0.95, 0.3, 0.05,
+                                          key=f"sc_alpha_hw_{agent}", label_visibility="collapsed")
+                    beta_val  = st.slider("beta (tendance)",  0.01, 0.50, 0.10, 0.01,
+                                          key=f"sc_beta_{agent}",  label_visibility="collapsed")
+                    gamma_val = st.slider("gamma (saisonnalite)", 0.01, 0.50, 0.10, 0.01,
+                                          key=f"sc_gamma_{agent}", label_visibility="collapsed")
+                    parts.append("DEM_HW")
+                    parts.append(f"ALPHA_{alpha_val}")
+                    parts.append(f"BETA_{beta_val}")
+                    parts.append(f"GAMMA_{gamma_val}")
+                else:
+                    st.markdown('<div class="ag" style="font-size:.74rem">Auto : MAPE le plus bas '
+                                'parmi MA, LES, HW.</div>', unsafe_allow_html=True)
+                sc_txt = "+".join(parts) if parts else "DEM_AUTO"
+                st.session_state.whatif_params["demande"] = {
+                    "method": method, "alpha": alpha_val, "beta": beta_val,
+                    "gamma": gamma_val, "ma_w": ma_w, "sc_txt": sc_txt}
+
+            if sc_txt not in ("DEM_AUTO","MKT_NOMINAL",""):
                 st.markdown(f'<div class="ai" style="font-size:.75rem;margin-top:.3rem">'
                             f'Scenario actif : <strong>{sc_txt}</strong></div>',
                             unsafe_allow_html=True)
@@ -4071,10 +4549,26 @@ def render_orchestrateur():
             p = data["production"]; arts = data["demande"]
             v_prod, c_prod, why_prod = _orch_verdict_prod(p)
             v_dem,  c_dem,  why_dem  = _orch_verdict_dem(arts)
-            verdicts = [v_prod, v_dem]
-            if "NO-GO" in verdicts: v_global,c_global = "NO-GO","#dc2626"
-            elif all(v=="GO" for v in verdicts if v!="N/D"): v_global,c_global = "GO","#16a34a"
-            else: v_global,c_global = "GO CONDITIONNEL","#d97706"
+
+            # Verdict global : source unique = _orch_verdict_global
+            # Evite la contradiction entre les boutons
+            flags_gono = _orch_detect_situation(data)
+            v_global, c_global = _orch_verdict_global(flags_gono)
+
+            # Note si What-If ameliore mais production locale = NO-GO
+            wi_note = ""
+            if v_prod == "NO-GO" and v_global != "NO-GO":
+                sc_actifs_g = data.get("scenarios_actifs", {})
+                sc_p = sc_actifs_g.get("production", "")
+                # N'afficher la note que si un vrai scénario est actif
+                if sc_p:
+                    wi_note = (
+                        f'<div style="background:#eff6ff;border-left:3px solid #2563eb;'
+                        f'border-radius:4px;padding:.3rem .6rem;margin:.2rem 0;font-size:.76rem">'
+                        f'<strong>Pourquoi GO CONDITIONNEL et non NO-GO ?</strong> '
+                        f'Le scenario What-If actif <strong>{sc_p}</strong> '
+                        f'ameliore la situation. Le plan est realisable sous conditions.'
+                        f'</div>')
 
             rows_gono = []
             if p:
@@ -4104,6 +4598,7 @@ def render_orchestrateur():
     <strong>Demande :</strong> {why_dem}
   </div>
 </div>"""
+            result += wi_note
             add_msg("orchestrateur","agent",result)
 
         elif q=="__ORCH_PLAN__":
